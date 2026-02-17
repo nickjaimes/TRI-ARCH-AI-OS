@@ -1,0 +1,585 @@
+Based on the Tri-Arch hardware foundations and the conceptual TAOS operating system, here is a comprehensive deep-dive technical specification document. This spec covers the hardware interfaces, kernel modules, API definitions, scheduler algorithms, and memory management protocols required to build the system.
+
+---
+
+TRI-ARCH SUPERCOMPUTER: Complete Technical Specification v2.0
+
+1.0 System Overview
+
+The Tri-Arch system is a heterogeneous supercomputing facility integrating three distinct processor architectures unified under a single operating system (TAOS). This document specifies the engineering details necessary for implementation.
+
+1.1 System Block Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TAOS CONTROL PLANE                           │
+│           (Head Nodes: 8x Intel Xeon Platinum 8592+)                │
+│                     InfiniBand NDR 400Gbps                          │
+└──────────────┬──────────────────────────┬───────────────────────────┘
+               │                          │
+    ┌──────────▼──────────┐    ┌──────────▼──────────┐
+    │  DOMAIN 1: CLASSICAL │    │  DOMAIN 2: PHOTONIC │
+    │  256 Nodes           │    │  64 Nodes           │
+    │  CPU/GPU Cluster     │    │  AI Accelerators    │
+    └──────────┬──────────┘    └──────────┬──────────┘
+               │                          │
+    ┌──────────▼──────────────────────────▼──────────┐
+    │         DOMAIN 3: QUANTUM (Photonic QPU)       │
+    │        16x ORCA PT-1 + 4x QuEra Aquila        │
+    └─────────────────────────────────────────────────┘
+```
+
+---
+
+2.0 Hardware Integration Layer (HIL)
+
+The HIL is the lowest level of TAOS, responsible for direct hardware communication and abstraction.
+
+2.1 Classical Domain Specifications
+
+Component Specification Interface Driver
+CPU Node Intel Xeon Max 9480 (56c, 112t) PCIe 5.0 x16 Linux Kernel 6.8+
+GPU NVIDIA H200 NVL (141GB HBM3e) SXM5 NVIDIA Driver 560.28
+Memory 2TB DDR5-5600 16 channels EDAC, DAX
+Storage 50PB Lustre (NVMe tier) 200Gb Omni-Path Lustre 2.16
+
+2.2 Photonic AI Domain Specifications
+
+The Photonic AI Domain consists of Q.ANT Native Processing Servers (NPS) Gen2.
+
+2.2.1 Hardware Registers
+
+The TFLNoI (Thin-Film Lithium Niobate on Insulator) chip is memory-mapped via PCIe BAR (Base Address Register) space.
+
+Register Offset Access Description
+NPU_CONTROL 0x0000 R/W Control word (Enable/Reset/Clock gate)
+NPU_STATUS 0x0004 R Status bits (Busy/Ready/Error/Thermal)
+NPU_INPUT_ADDR 0x0010 W DMA source address (64-bit)
+NPU_OUTPUT_ADDR 0x0018 W DMA destination address (64-bit)
+NPU_KERNEL_ADDR 0x0020 W Pointer to loaded Q.PAL kernel
+NPU_BATCH_SIZE 0x0028 W Batch size for inference (1-1024)
+NPU_PRECISION 0x002C W Precision mode: 0=FP16, 1=BF16, 2=INT8
+NPU_THERMAL_LIMIT 0x0100 R/W Thermal threshold in °C (passive)
+
+2.2.2 DMA Engine
+
+The NPU includes a dedicated DMA engine for direct memory access to/from GPU HBM.
+
+```c
+// DMA Descriptor Structure (aligned to 64 bytes)
+struct npu_dma_descriptor {
+    uint64_t src_addr;      // Source address (GPU/CPU physical)
+    uint64_t dst_addr;      // Destination address (NPU on-chip)
+    uint32_t size;          // Transfer size in bytes
+    uint32_t flags;         // Transfer flags (INT, SYNC)
+    uint64_t next_desc;     // Next descriptor for scatter-gather
+};
+```
+
+2.3 Photonic Quantum Domain Specifications
+
+The Quantum Domain integrates ORCA PT-1 and QuEra Aquila processors.
+
+2.3.1 ORCA PT-1 Interface
+
+The PT-1 is controlled via a dedicated control server connected over 100GbE.
+
+Control Channel Protocol Latency Function
+Circuit Compilation gRPC/Protobuf 10-50ms Submit OpenQASM circuit
+Photon Detection UDP Stream <1µs Real-time click detection
+Calibration REST API 1-10s Adjust interferometer phases
+
+2.3.2 QuEra Aquila Interface
+
+The Aquila neutral-atom QPU interfaces via PCIe FPGA card.
+
+Register Offset Description
+AQUILA_TRAP_CONTROL 0x2000 Optical trap array configuration
+AQUILA_RYDBERG_LASER 0x3000 Global Rydberg laser power
+AQUILA_READOUT 0x4000 Camera readout trigger
+
+---
+
+3.0 TAOS Kernel Architecture
+
+3.1 Microkernel Components
+
+The TAOS microkernel runs on the head nodes and classical compute nodes.
+
+3.1.1 Inter-Domain Communication (IDC)
+
+IDC uses a custom protocol over InfiniBand RDMA with zero-copy transfers.
+
+```protobuf
+// IDC Message Definition
+message IDCMessage {
+    uint64 message_id = 1;
+    uint32 source_domain = 2; // 0=Classical, 1=PhotonicAI, 2=Quantum
+    uint32 dest_domain = 3;
+    uint32 message_type = 4;   // 0=Data, 1=Kernel, 2=Command, 3=Sync
+    
+    // Payload (oneof)
+    oneof payload {
+        DataPayload data = 5;
+        KernelPayload kernel = 6;
+        CommandPayload command = 7;
+        SyncPayload sync = 8;
+    }
+    
+    uint64 timestamp = 9;      // TAOS global clock
+    uint32 priority = 10;       // 0-255 (higher = more urgent)
+}
+```
+
+3.1.2 Global Clock Synchronization
+
+TAOS implements a distributed clock synchronized via PTP (Precision Time Protocol) with nanosecond accuracy across all domains.
+
+Clock Domain Source Accuracy Drift Compensation
+Classical PTP Grandmaster (GPS) ±100ns Software PLL
+Photonic AI Local OCXO disciplined by PTP ±500ns Hardware PLL
+Quantum FPGA timestamp counter ±10ns TDC (Time-to-Digital Converter)
+
+3.2 Domain Servers
+
+3.2.1 Photonic AI Daemon (PAD)
+
+The PAD runs on each Q.ANT NPS host and manages the NPU.
+
+Initialization Sequence:
+
+```c
+// PAD startup procedure
+int pad_init() {
+    // 1. Map PCIe BAR space
+    bar_base = mmap(NULL, BAR_SIZE, PROT_READ|PROT_WRITE, 
+                     MAP_SHARED, fd, 0);
+    
+    // 2. Reset NPU
+    write_register(NPU_CONTROL, RESET_BIT);
+    while(read_register(NPU_STATUS) & BUSY_BIT);
+    
+    // 3. Load default calibration
+    load_interferometer_calibration();
+    
+    // 4. Enable thermal monitoring thread
+    pthread_create(&thermal_thread, NULL, pad_thermal_monitor, NULL);
+    
+    // 5. Register with TAOS scheduler
+    taos_register_domain(TAOS_DOMAIN_PHOTONIC, pid);
+    
+    return 0;
+}
+```
+
+Kernel Execution Flow:
+
+```python
+# PAD kernel execution (simplified Python binding)
+def execute_photonic_kernel(kernel_bytes, input_tensor):
+    # 1. Allocate NPU memory
+    input_addr = npu_malloc(input_tensor.nbytes)
+    output_addr = npu_malloc(output_size)
+    
+    # 2. Copy input via DMA
+    dma_transfer(src=input_tensor.phys_addr, 
+                 dst=input_addr, 
+                 size=input_tensor.nbytes)
+    
+    # 3. Load kernel
+    write_register(NPU_KERNEL_ADDR, kernel_bytes.phys_addr)
+    write_register(NPU_BATCH_SIZE, 1)
+    write_register(NPU_PRECISION, FP16)
+    
+    # 4. Start execution
+    write_register(NPU_CONTROL, EXECUTE_BIT)
+    
+    # 5. Poll for completion
+    while(read_register(NPU_STATUS) & BUSY_BIT):
+        if check_thermal_threshold():
+            throttle_execution()
+    
+    # 6. Read back results
+    dma_transfer(src=output_addr, 
+                 dst=output_tensor.phys_addr, 
+                 size=output_size)
+    
+    return output_tensor
+```
+
+3.2.2 Quantum Orchestration Daemon (QOD)
+
+The QOD manages quantum processor lifecycle.
+
+Circuit Submission Protocol:
+
+```json
+// QOD REST API - Submit Circuit
+POST /api/v1/quantum/circuit
+{
+    "circuit_type": "bosonic_sampling",
+    "qasm": "OPENQASM 3.0; qubit[20] q; h q[0]; cz q[0], q[1]; ...",
+    "shots": 1000,
+    "backend": "orca-pt1-03",
+    "priority": 5,
+    "timeout_ms": 5000,
+    "calibration_id": "cal_20260217_1200"
+}
+
+// Response
+{
+    "job_id": "job_7a9f3b2c",
+    "estimated_duration_ms": 850,
+    "queue_position": 2,
+    "coherence_deadline": "2026-02-17T12:05:00.000Z"
+}
+```
+
+Results Streaming:
+
+```python
+# Real-time photon detection stream (UDP)
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(('0.0.0.0', 9999))
+
+while True:
+    data, addr = sock.recvfrom(1024)
+    # Format: timestamp (ns), channel_id (0-15), photon_count
+    ts, ch, count = struct.unpack('QBB', data)
+    
+    # Forward to TAOS scheduler via shared memory
+    shm_queue.push((ts, ch, count))
+```
+
+---
+
+4.0 TAOS Scheduler (Slurm-NG)
+
+4.1 Resource Representation
+
+Resources are represented in a hierarchical format understood by Slurm-NG.
+
+```yaml
+# Node configuration example
+NodeName: photon-001
+Domain: PHOTONIC
+Arch: TFLNoI-Gen2
+CPUs: 16   # Host CPUs
+RealMemory: 131072  # 128GB host memory
+Features: photonic,ai,npu
+Gres:
+  - npu:4   # 4 NPU cores
+  - photonic_mem:64  # 64GB photonic memory
+State: UNKNOWN
+
+NodeName: quantum-001
+Domain: QUANTUM
+Arch: ORCA-PT1
+Qubits: 12
+Topology: linear
+Features: quantum,bosonic
+Gres:
+  - qpu:1
+  - qmem:20  # 20 qubits
+State: UNKNOWN
+```
+
+4.2 Scheduling Algorithm
+
+The scheduler implements a three-level priority queue:
+
+1. Real-time Quantum: Jobs with active qubits (cannot be preempted)
+2. Photonic Inference: High-throughput AI workloads
+3. Classical Batch: Traditional HPC workloads
+
+```python
+# Simplified scheduling logic
+def schedule():
+    while True:
+        # Level 1: Check for expiring quantum coherence
+        for job in quantum_active_jobs:
+            if job.coherence_deadline - now() < 1000:  # 1µs
+                job.execute_immediately()
+        
+        # Level 2: Backfill photonic AI
+        if photonic_queue and npu_available():
+            job = photonic_queue.pop()
+            dispatch_to_photonic(job)
+        
+        # Level 3: Classical batch
+        if classical_queue and cpus_available():
+            job = classical_queue.pop()
+            dispatch_to_classical(job)
+        
+        # Load balancing check
+        if quantum_idle() and photonic_backlog > THRESHOLD:
+            convert_ai_to_quantum()  # Hybrid mode
+```
+
+4.3 Coherence-Aware Scheduling
+
+Quantum jobs include a coherence deadline property. The scheduler guarantees execution start before qubits decohere.
+
+```c
+// Coherence guarantee structure
+struct coherence_guarantee {
+    uint64_t job_id;
+    uint64_t deadline_ns;      // Absolute time in ns
+    uint32_t required_qubits;
+    uint32_t circuit_depth;
+    uint32_t estimated_exec_ns;
+    
+    // Penalty if missed
+    float penalty;  // 0.0-1.0 (fraction of job priority)
+};
+```
+
+---
+
+5.0 Memory Management Unit (MMU)
+
+5.1 Unified Address Space
+
+TAOS implements a 128-bit virtual address space spanning all memory types.
+
+Address Range Domain Translation
+0x0000_0000_0000_0000 - 0x3FFF_FFFF_FFFF_FFFF Classical DRAM Page tables
+0x4000_0000_0000_0000 - 0x7FFF_FFFF_FFFF_FFFF GPU HBM GPU MMU
+0x8000_0000_0000_0000 - 0xBFFF_FFFF_FFFF_FFFF Photonic memory NPU MMU
+0xC000_0000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF Quantum register QOD translation
+
+5.2 Memory Coherence Protocol
+
+TAOS implements a custom coherence protocol for cross-domain memory access.
+
+```
+Classical → Photonic:
+1. CPU pins memory pages
+2. DMA engine transfers to NPU
+3. NPU acknowledges completion
+4. CPU invalidates cache lines
+
+Photonic → Quantum:
+1. NPU writes to optical buffer
+2. Laser encodes classical bits into photon states
+3. Photons injected into QPU waveguide
+4. Quantum state prepared within coherence window
+```
+
+5.3 Page Migration Policy
+
+```python
+# Dynamic page migration based on access patterns
+def monitor_page_access(page):
+    # Track which domains access this page
+    domains = page.access_tracking.get_recent()
+    
+    if domains.count(QUANTUM) > THRESHOLD:
+        # Migrate to quantum memory
+        migrate_to_quantum(page)
+    elif domains.count(PHOTONIC) > THRESHOLD:
+        # Migrate to photonic memory
+        migrate_to_photonic(page)
+    else:
+        # Keep in classical
+        pass
+```
+
+---
+
+6.0 Programming Model: TAOS-QL Specification
+
+6.1 Language Extensions
+
+TAOS-QL extends C++23 with quantum and photonic primitives.
+
+```cpp
+// Quantum kernel specification
+[[taos::quantum_kernel]]
+void qaoa_circuit(qreg& q, std::vector<double> params) {
+    // Apply parameterized quantum circuit
+    for (int i = 0; i < q.size(); i++) {
+        rx(params[i], q[i]);
+    }
+    
+    for (int i = 0; i < q.size()-1; i++) {
+        cz(q[i], q[i+1]);
+    }
+    
+    measure(q);
+}
+
+// Photonic kernel specification
+[[taos::photonic_kernel]]
+tensor photonic_convolution(tensor input, tensor kernel) {
+    // Executed on TFLNoI NPU
+    return convolution_2d(input, kernel, 
+                          stride=2, 
+                          activation=RELU,
+                          precision=FP16);
+}
+
+// Hybrid function
+[[taos::hybrid]]
+double solve_optimization(problem p) {
+    // Classical preprocessing
+    auto features = extract_features(p);
+    
+    // Photonic inference
+    auto encoded = photonic_convolution(features, kernel);
+    
+    // Quantum optimization
+    qreg q(20);
+    qaoa_circuit(q, encoded);
+    
+    // Classical post-processing
+    return compute_energy(measurement_results(q));
+}
+```
+
+6.2 Compiler Pipeline
+
+```
+Source Code (.cpp)
+        ↓
+TAOS Frontend (Clang-based)
+   - Parse [[taos::*]] attributes
+   - Validate cross-domain calls
+        ↓
+Intermediate Representation (MLIR)
+   - Quantum dialect
+   - Photonic dialect  
+   - Classical dialect
+        ↓
+Domain-Specific Backends
+   - Classical → LLVM IR (x86/NVPTX)
+   - Photonic → Q.PAL instructions
+   - Quantum → OpenQASM 3.0
+        ↓
+Executable + Metadata
+```
+
+---
+
+7.0 Performance Monitoring and Profiling
+
+7.1 TAOS-Prof Tool
+
+```bash
+# Profile hybrid execution
+taos-prof --domains=all --output=profile.json ./my_app
+
+# Generated report example
+{
+    "timeline": [
+        {"time": 0.0, "domain": "classical", "event": "load_data"},
+        {"time": 0.5, "domain": "photonic", "event": "inference_start"},
+        {"time": 0.8, "domain": "quantum", "event": "circuit_submit"},
+        {"time": 1.2, "domain": "quantum", "event": "coherence_begin"},
+        {"time": 1.3, "domain": "classical", "event": "result_read"}
+    ],
+    "metrics": {
+        "classical_util": 0.85,
+        "photonic_util": 0.92,
+        "quantum_idle": 0.15,
+        "coherence_wait": 0.05,
+        "dma_bandwidth_gbps": 380
+    },
+    "bottlenecks": [
+        "quantum_calibration_delay (avg 50ms)"
+    ]
+}
+```
+
+7.2 Real-Time Dashboard
+
+The TAOS web dashboard provides real-time visibility:
+
+```
+┌─────────────────────────────────────────────────┐
+│ TRI-ARCH SYSTEM HEALTH ─────────────────────────│
+│ Classical:  ████████░░ 82% (208/256 nodes)     │
+│ Photonic:   ████████░░ 85% (54/64 NPUs)        │
+│ Quantum:    ████░░░░░░ 35% (6/16 QPUs active)  │
+│                                                  │
+│ Coherence Deadlines: ✓ 98.7% met                │
+│ Photonic Latency:     1.2µs avg                 │
+│ DMA Throughput:       382 Gbps                  │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+8.0 Security Architecture
+
+8.1 Domain Isolation
+
+Isolation Level Mechanism Prevents
+Classical KVM + SEV-SNP Cross-VM side channels
+Photonic Optical isolators Photon leakage between tenants
+Quantum Time-division multiplexing Crosstalk between circuits
+
+8.2 Authentication
+
+All cross-domain RPC requires JWT tokens signed by the TAOS security module.
+
+```python
+# Generate token with domain capabilities
+token = taos_auth.generate_token(
+    user="researcher@lab",
+    domains=["classical", "photonic"],
+    max_qubits=20,
+    max_photonic_mem=16384,
+    expiry="2026-02-18T00:00:00Z"
+)
+
+# Token validated at every domain boundary
+if not validate_token(token, requested_domain):
+    raise TAOSPermissionError()
+```
+
+---
+
+9.0 Deployment Requirements
+
+9.1 Physical Infrastructure
+
+Component Requirement Notes
+Power 2.5 MW 1.8 MW classical + 0.7 MW cooling
+Cooling 800 kW Photonic: passive, Quantum: active vibration isolation
+Floor space 500 m² 300 m² classical, 150 m² photonic, 50 m² quantum
+Network 400 Gb/s backbone Redundant InfiniBand fabric
+Vibration < 10 Hz Quantum domain on isolated slab
+
+9.2 Software Stack
+
+```
+TAOS Kernel v2.0
+├── Linux Kernel 6.8 (patched for RDMA over InfiniBand)
+├── NVIDIA Driver 560.28
+├── CUDA 12.8 + cuQuantum 24.08
+├── Q.ANT SDK 2.1 (Q.PAL)
+├── ORCA Controller 1.5
+├── QuEra FPGA Firmware 3.2
+└── Slurm-NG 24.11
+```
+
+---
+
+10.0 Conclusion
+
+This technical specification provides the complete blueprint for building the Tri-Arch supercomputer and its TAOS operating system. The system is designed to be:
+
+· Heterogeneous: Seamlessly integrating three fundamentally different architectures
+· Programmable: Unified programming model (TAOS-QL) hiding hardware complexity
+· Schedulable: Coherence-aware scheduling guaranteeing quantum job completion
+· Observable: Comprehensive profiling and real-time monitoring
+· Secure: Hardware-enforced isolation between domains
+
+The specification is grounded in existing technology (NVIDIA GPUs, Q.ANT NPUs, ORCA QPUs) while extending forward to create a truly unified hybrid supercomputing platform.
+
+---
+
+This specification is provided for architectural planning purposes. Actual implementation requires coordination with hardware vendors and further refinement based on specific deployment requirements.
