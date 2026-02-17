@@ -1,3 +1,5 @@
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/e39e5c55-1490-4c7b-be92-11a8287978c9" />
+
 # TRI-ARCH-AI-OS
 
 Tri-Arch unifies classical, photonic AI, and quantum computing into a single programmable platform for the post-Moore computing era.
