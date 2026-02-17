@@ -1,5 +1,7 @@
 # TRI-ARCH-AI-OS
 
+Tri-Arch unifies classical, photonic AI, and quantum computing into a single programmable platform for the post-Moore computing era.
+
 Tri-Arch: Unified Classical, Photonic AI, and Quantum Computing Platform
 
 https://img.shields.io/badge/License-MIT-yellow.svg
@@ -201,7 +203,43 @@ Comprehensive documentation is available online at tri-arch.readthedocs.io. Key 
 · Admin Guide – Installation, configuration, and maintenance.
 · Examples – Complete hybrid applications.
 
----
+## Example Applications
+
+• Planetary-scale AI simulation
+• Drug discovery & molecular simulation
+• Climate and energy optimisation
+• Autonomous space systems
+• Hybrid AI + quantum optimisation workloads
+
+Tri-Arch serves as the hybrid compute backbone for
+future intelligent systems including:
+• QUENNE Stacked Intelligence platforms
+• Autonomous spacecraft and propulsion systems
+• Planetary-scale simulation and defense systems
+• Smart infrastructure and data centers
+
+Deployment Modes
+• Supercomputing centers
+• Enterprise hybrid clusters
+• Cloud hybrid computing services
+• Research emulation environments
+
+## Roadmap
+
+2026 – Emulator + developer release
+2027 – First production hybrid cluster deployments
+2028 – Cloud hybrid computing integration
+2030 – Planetary-scale hybrid compute networks
+
+Strategic Observation
+
+Tri-Arch + QUENNE + Sentinel together now form:
+
+• Intelligence architecture
+• Hybrid computing substrate
+• Planetary defense & infrastructure systems
+
+This is evolving into a full civilization-scale compute + cognition stack, not just isolated projects.
 
 Contributing
 
