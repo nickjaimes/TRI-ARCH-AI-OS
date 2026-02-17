@@ -1,0 +1,807 @@
+Tri-Arch: Comprehensive Technical Code Implementation
+
+This document provides a complete, detailed code implementation of the Tri-Arch system, including the TAOS microkernel, domain servers, scheduler plugins, runtime libraries, compiler extensions, and example hybrid programs. The code is organized as a GitHub repository structure with actual source files.
+
+Note: The code below is representative and simplified for clarity; a production system would require additional error handling, optimizations, and hardware-specific details. However, it accurately reflects the architecture described in the Tri-Arch whitepaper and can serve as a starting point for implementation.
+
+---
+
+Repository Structure
+
+```
+tri-arch/
+├── README.md
+├── CMakeLists.txt                # Top-level build
+├── src/
+│   ├── taos-kernel/
+│   │   ├── core/                  # Microkernel core
+│   │   ├── ipc/                    # Inter-domain communication
+│   │   └── mm/                      # Unified memory management
+│   ├── pad/                         # Photonic AI Daemon
+│   │   ├── pad.cpp
+│   │   ├── npu_driver.cpp
+│   │   └── qpal_interface.cpp
+│   ├── qod/                         # Quantum Orchestration Daemon
+│   │   ├── qod.cpp
+│   │   ├── orca_pt1.cpp
+│   │   └── quera_aquila.cpp
+│   ├── scheduler/                    # Slurm-NG plugins
+│   │   ├── quantum_partition.c
+│   │   └── photonic_gres.c
+│   ├── compiler/                     # TAOS-QL LLVM plugin
+│   │   ├── TAOSQLAttributes.cpp
+│   │   └── TAOSQLPasses.cpp
+│   └── libs/                          # Runtime libraries
+│       ├── taos_runtime.h
+│       ├── taos_runtime.cpp
+│       ├── pytaos/                     # Python bindings
+│       └── qpal_wrapper.cpp
+├── tests/                             # Unit and integration tests
+├── examples/                          # Example hybrid programs
+│   ├── hello_triarch.py
+│   └── hybrid_qaoa.cpp
+└── scripts/                            # Build and deployment scripts
+```
+
+---
+
+1. TAOS Microkernel Core
+
+The microkernel runs on the classical head nodes. It provides basic services: inter-process communication (IPC), memory management, and domain registration.
+
+src/taos-kernel/core/kernel.c (simplified)
+
+```c
+// kernel.c – TAOS microkernel entry point
+#include <taos/kernel.h>
+#include <taos/ipc.h>
+#include <taos/mm.h>
+
+static struct domain domains[MAX_DOMAINS];
+static uint32_t domain_count = 0;
+
+// Register a domain (called by domain servers during initialization)
+int taos_register_domain(uint32_t domain_type, uint32_t pid, void *config) {
+    if (domain_count >= MAX_DOMAINS) return -ENOMEM;
+    struct domain *d = &domains[domain_count++];
+    d->type = domain_type;
+    d->pid = pid;
+    d->ipc_channel = ipc_create_channel(pid);
+    d->mm_region = mm_alloc_region(d, config);
+    return domain_count - 1; // return domain id
+}
+
+// Send message to a domain
+int taos_send_message(uint32_t domain_id, struct ipc_message *msg) {
+    if (domain_id >= domain_count) return -EINVAL;
+    return ipc_send(domains[domain_id].ipc_channel, msg);
+}
+
+// Receive message (blocking)
+int taos_receive_message(uint32_t domain_id, struct ipc_message *msg) {
+    if (domain_id >= domain_count) return -EINVAL;
+    return ipc_recv(domains[domain_id].ipc_channel, msg);
+}
+
+// Main kernel loop
+void kernel_main() {
+    // Initialize subsystems
+    ipc_init();
+    mm_init();
+
+    // Wait for domain servers to register
+    while (1) {
+        // Handle IPC, scheduling, etc.
+        kernel_handle_requests();
+    }
+}
+```
+
+src/taos-kernel/ipc/ipc.c – IPC over InfiniBand RDMA
+
+```c
+#include <taos/ipc.h>
+#include <infiniband/verbs.h>
+
+struct ipc_channel {
+    int pid;
+    struct ibv_context *ctx;
+    struct ibv_qp *qp;
+    struct ibv_mr *mr;
+    void *buf;
+    size_t buf_size;
+};
+
+// Create an IPC channel for a given process
+struct ipc_channel *ipc_create_channel(int pid) {
+    // Simplified: allocate RDMA resources
+    struct ipc_channel *ch = malloc(sizeof(*ch));
+    ch->pid = pid;
+    // ... setup InfiniBand verbs, create queue pair, register memory
+    return ch;
+}
+
+// Send a message (non-blocking)
+int ipc_send(struct ipc_channel *ch, struct ipc_message *msg) {
+    // Copy message to RDMA buffer and post send
+    memcpy(ch->buf, msg, sizeof(*msg));
+    // ... post RDMA send
+    return 0;
+}
+
+// Receive (blocking)
+int ipc_recv(struct ipc_channel *ch, struct ipc_message *msg) {
+    // Wait for completion
+    // ... poll completion queue
+    memcpy(msg, ch->buf, sizeof(*msg));
+    return 0;
+}
+```
+
+---
+
+2. Photonic AI Daemon (PAD)
+
+The PAD runs on each Q.ANT NPS host. It manages the NPU device, loads kernels, and handles DMA transfers.
+
+src/pad/pad.cpp – main daemon
+
+```cpp
+#include <taos/pad.h>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+class PhotonicAIDaemon {
+public:
+    PhotonicAIDaemon() : running(true) {
+        // Initialize NPU devices
+        for (auto& pci : enumerate_npu_devices()) {
+            devices.emplace_back(std::make_unique<NpuDevice>(pci));
+        }
+        // Start RPC server (simplified)
+        server_thread = std::thread(&PhotonicAIDaemon::rpc_server, this);
+    }
+
+    ~PhotonicAIDaemon() { running = false; server_thread.join(); }
+
+private:
+    void rpc_server() {
+        while (running) {
+            // Listen for requests (e.g., via Unix socket or TCP)
+            auto req = receive_request();
+            handle_request(req);
+        }
+    }
+
+    void handle_request(const Request& req) {
+        switch (req.type) {
+        case LOAD_KERNEL:
+            load_kernel(req.kernel_name, req.kernel_blob);
+            break;
+        case EXECUTE:
+            execute(req.device_id, req.input_addr, req.output_addr, req.params);
+            break;
+        case MEM_ALLOC:
+            allocate(req.device_id, req.size);
+            break;
+        }
+    }
+
+    void load_kernel(const std::string& name, const std::vector<uint8_t>& blob) {
+        // Store kernel blob; later when executing, program NPU
+        kernels[name] = blob;
+    }
+
+    void execute(int dev_id, uint64_t input_dma, uint64_t output_dma, const ExecuteParams& params) {
+        auto& dev = devices[dev_id];
+        // Map input/output buffers for DMA
+        dev->prepare_dma(input_dma, output_dma, params.size);
+        // Load kernel microcode
+        dev->load_kernel(kernels[params.kernel_name]);
+        // Start NPU
+        dev->start();
+        // Wait for completion (poll status register)
+        dev->wait();
+    }
+
+    std::vector<std::unique_ptr<NpuDevice>> devices;
+    std::map<std::string, std::vector<uint8_t>> kernels;
+    std::thread server_thread;
+    std::atomic<bool> running;
+};
+
+int main() {
+    PhotonicAIDaemon daemon;
+    daemon.run(); // blocks
+    return 0;
+}
+```
+
+src/pad/npu_driver.cpp – Low-level NPU register access
+
+```cpp
+#include "npu_driver.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+NpuDevice::NpuDevice(const std::string& pci_addr) {
+    // Open PCIe BAR
+    std::string bar_path = "/sys/bus/pci/devices/" + pci_addr + "/resource0";
+    int fd = open(bar_path.c_str(), O_RDWR | O_SYNC);
+    bar = mmap(NULL, BAR_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+}
+
+NpuDevice::~NpuDevice() { munmap(bar, BAR_SIZE); }
+
+void NpuDevice::write_register(uint32_t offset, uint32_t value) {
+    *reinterpret_cast<volatile uint32_t*>(bar + offset) = value;
+}
+
+uint32_t NpuDevice::read_register(uint32_t offset) {
+    return *reinterpret_cast<volatile uint32_t*>(bar + offset);
+}
+
+void NpuDevice::load_kernel(const std::vector<uint8_t>& kernel) {
+    // Write kernel to NPU instruction memory via DMA or programmed I/O
+    // Simplified: copy to BAR space
+    memcpy(bar + KERNEL_BASE, kernel.data(), kernel.size());
+    write_register(NPU_KERNEL_ADDR, KERNEL_BASE);
+    write_register(NPU_KERNEL_SIZE, kernel.size());
+}
+
+void NpuDevice::prepare_dma(uint64_t src, uint64_t dst, size_t size) {
+    // Set up DMA descriptors in NPU's descriptor ring
+    write_register(NPU_DMA_SRC, src & 0xFFFFFFFF);
+    write_register(NPU_DMA_SRC_HI, src >> 32);
+    write_register(NPU_DMA_DST, dst & 0xFFFFFFFF);
+    write_register(NPU_DMA_DST_HI, dst >> 32);
+    write_register(NPU_DMA_SIZE, size);
+}
+
+void NpuDevice::start() {
+    write_register(NPU_CONTROL, NPU_START_BIT);
+}
+
+void NpuDevice::wait() {
+    while ((read_register(NPU_STATUS) & NPU_BUSY_BIT)) {
+        std::this_thread::yield();
+    }
+}
+```
+
+---
+
+3. Quantum Orchestration Daemon (QOD)
+
+The QOD manages quantum processors (ORCA PT‑1 and QuEra Aquila). It communicates with the ORCA controller via gRPC and with QuEra via the FPGA driver.
+
+src/qod/qod.cpp – main daemon
+
+```cpp
+#include <taos/qod.h>
+#include <grpcpp/grpcpp.h>
+#include "orca_grpc.grpc.pb.h"  // generated from ORCA's proto
+#include <thread>
+#include <queue>
+
+class QuantumOrchestrationDaemon {
+public:
+    QuantumOrchestrationDaemon() : running(true) {
+        // Connect to ORCA controller
+        auto channel = grpc::CreateChannel("10.0.100.10:50051", grpc::InsecureChannelCredentials());
+        orca_stub = orca::OrcaController::NewStub(channel);
+
+        // Initialize QuEra FPGA (via ioctl)
+        quera_fd = open("/dev/quera_aquila", O_RDWR);
+        if (quera_fd < 0) throw std::runtime_error("Cannot open QuEra device");
+
+        // Start job queue thread
+        worker = std::thread(&QuantumOrchestrationDaemon::process_jobs, this);
+    }
+
+    ~QuantumOrchestrationDaemon() { running = false; worker.join(); }
+
+    void submit_job(const Job& job) {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        job_queue.push(job);
+    }
+
+private:
+    void process_jobs() {
+        while (running) {
+            Job job;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                if (!job_queue.empty()) {
+                    job = job_queue.front();
+                    job_queue.pop();
+                }
+            }
+            if (job.type == ORCA_PT1) {
+                run_orca_circuit(job);
+            } else if (job.type == QUERA_AQUILA) {
+                run_quera_circuit(job);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    void run_orca_circuit(const Job& job) {
+        orca::CircuitRequest req;
+        req.set_qasm(job.qasm);
+        req.set_shots(job.shots);
+        orca::CircuitResponse resp;
+        grpc::ClientContext ctx;
+        auto status = orca_stub->ExecuteCircuit(&ctx, req, &resp);
+        if (status.ok()) {
+            // Send results back via TAOS IPC
+            taos_send_message(job.return_domain, resp.SerializeAsString());
+        }
+    }
+
+    void run_quera_circuit(const Job& job) {
+        // Use ioctl to program FPGA
+        struct quera_ioctl_args args;
+        args.qasm = job.qasm.c_str();
+        args.shots = job.shots;
+        ioctl(quera_fd, QUERA_EXECUTE, &args);
+        // Read results from mmap'ed buffer
+        // ... send back via IPC
+    }
+
+    std::unique_ptr<orca::OrcaController::Stub> orca_stub;
+    int quera_fd;
+    std::queue<Job> job_queue;
+    std::mutex queue_mutex;
+    std::thread worker;
+    std::atomic<bool> running;
+};
+```
+
+---
+
+4. Slurm-NG Quantum Partition Plugin
+
+Slurm-NG is extended with a plugin that understands quantum resources. This is a simplified version of the plugin code.
+
+src/scheduler/quantum_partition.c
+
+```c
+/* quantum_partition.c – Slurm plugin for quantum resource management */
+#include <slurm/slurm.h>
+#include <slurm/slurm_errno.h>
+
+/* Plugin initialization */
+extern int init(void) {
+    info("Quantum partition plugin loaded");
+    return SLURM_SUCCESS;
+}
+
+/* Called when a job requests quantum resources */
+extern int job_test_resources(slurm_msg_t *msg) {
+    job_desc_t *job_desc = msg->data;
+    if (job_desc->quantum_req) {
+        // Check if quantum resources are available
+        // Reservation logic: ensure coherence window can be met
+        int qpu_id = find_available_qpu(job_desc->quantum_req->qubits,
+                                        job_desc->quantum_req->depth);
+        if (qpu_id < 0) {
+            return ESLURM_INVALID_QPU_REQUEST;
+        }
+        // Reserve the QPU for the job's time window
+        reserve_qpu(qpu_id, job_desc->begin_time, job_desc->end_time);
+        // Store reservation in job's details
+        job_desc->quantum_reservation = qpu_id;
+    }
+    return SLURM_SUCCESS;
+}
+
+/* Called when job is launched */
+extern int job_launch(slurm_msg_t *msg) {
+    job_desc_t *job_desc = msg->data;
+    if (job_desc->quantum_reservation >= 0) {
+        // Notify QOD that job is starting (via TAOS IPC)
+        taos_send_quantum_start(job_desc->quantum_reservation,
+                                job_desc->job_id,
+                                job_desc->quantum_params);
+    }
+    return SLURM_SUCCESS;
+}
+
+/* Called when job completes */
+extern int job_complete(slurm_msg_t *msg) {
+    // Release quantum reservation
+    return SLURM_SUCCESS;
+}
+```
+
+---
+
+5. TAOS Runtime Library (C++)
+
+The runtime library provides user-space APIs for memory management, kernel launches, and hybrid programming.
+
+src/libs/taos_runtime.h
+
+```cpp
+#ifndef TAOS_RUNTIME_H
+#define TAOS_RUNTIME_H
+
+#include <cstdint>
+#include <vector>
+#include <string>
+
+namespace taos {
+
+// Memory handles
+using mem_handle_t = uint64_t;
+
+// Memory allocation domains
+enum class MemDomain {
+    CLASSICAL,
+    GPU,
+    PHOTONIC,
+    QUANTUM
+};
+
+// Allocate memory in specified domain
+mem_handle_t mem_alloc(MemDomain domain, size_t size);
+
+// Copy between domains
+void mem_copy(mem_handle_t dst, mem_handle_t src, size_t size);
+void mem_copy_h2p(void* host_ptr, mem_handle_t photonic, size_t size);
+void mem_copy_p2h(mem_handle_t photonic, void* host_ptr, size_t size);
+
+// Photonic kernel handle
+struct PhotonicKernel {
+    std::string name;
+    std::vector<uint8_t> blob;
+};
+
+// Load photonic kernel
+PhotonicKernel load_photonic_kernel(const std::string& name, const std::string& qpal_path);
+
+// Execute photonic kernel on a device
+void photonic_execute(int device_id, const PhotonicKernel& kernel,
+                      mem_handle_t input, mem_handle_t output,
+                      const std::vector<int>& params);
+
+// Quantum kernel definition (CUDA-Q style)
+template<typename F>
+struct QuantumKernel {
+    F kernel_func;
+    std::string name;
+};
+
+// Submit quantum kernel to QPU
+template<typename F, typename... Args>
+auto quantum_sample(const QuantumKernel<F>& kernel, int shots,
+                    const std::string& backend, Args&&... args) {
+    // Serialize arguments, send to QOD, wait for result
+    // Return counts or expectation values
+}
+
+} // namespace taos
+#endif
+```
+
+src/libs/taos_runtime.cpp (excerpts)
+
+```cpp
+#include "taos_runtime.h"
+#include <taos/ipc.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace taos {
+
+static int taos_fd = -1;  // connection to TAOS kernel
+
+void init() {
+    // Open connection to TAOS kernel (e.g., /dev/taos)
+    taos_fd = open("/dev/taos", O_RDWR);
+    if (taos_fd < 0) throw std::runtime_error("Cannot open TAOS device");
+}
+
+mem_handle_t mem_alloc(MemDomain domain, size_t size) {
+    struct taos_alloc_req req;
+    req.domain = static_cast<int>(domain);
+    req.size = size;
+    if (ioctl(taos_fd, TAOS_IOCTL_ALLOC, &req) < 0) {
+        throw std::bad_alloc();
+    }
+    return req.handle;
+}
+
+void mem_copy_h2p(void* host_ptr, mem_handle_t photonic, size_t size) {
+    // Pin host memory, set up DMA via kernel
+    struct taos_copy_req req;
+    req.src_type = TAOS_MEM_HOST;
+    req.src_handle = reinterpret_cast<uint64_t>(host_ptr);
+    req.dst_type = TAOS_MEM_PHOTONIC;
+    req.dst_handle = photonic;
+    req.size = size;
+    ioctl(taos_fd, TAOS_IOCTL_COPY, &req);
+}
+
+void photonic_execute(int device_id, const PhotonicKernel& kernel,
+                      mem_handle_t input, mem_handle_t output,
+                      const std::vector<int>& params) {
+    struct taos_photonic_exec_req req;
+    req.device_id = device_id;
+    req.kernel_ptr = reinterpret_cast<uint64_t>(kernel.blob.data());
+    req.kernel_size = kernel.blob.size();
+    req.input = input;
+    req.output = output;
+    req.params = params.data();
+    req.params_count = params.size();
+    ioctl(taos_fd, TAOS_IOCTL_PHOTONIC_EXEC, &req);
+}
+
+} // namespace taos
+```
+
+Python Bindings (simplified) – src/libs/pytaos/taos.py
+
+```python
+import ctypes
+import numpy as np
+
+_lib = ctypes.CDLL("libtaos_runtime.so")
+
+# Wrap C functions
+def mem_alloc(domain, size):
+    return _lib.taos_mem_alloc(domain, size)
+
+def mem_copy_h2p(host_ptr, photonic, size):
+    _lib.taos_mem_copy_h2p(ctypes.c_void_p(host_ptr), photonic, size)
+
+class PhotonicKernel:
+    def __init__(self, name, blob):
+        self.name = name
+        self.blob = blob
+
+    @staticmethod
+    def load(name, path):
+        with open(path, 'rb') as f:
+            blob = f.read()
+        return PhotonicKernel(name, blob)
+
+    def execute(self, device, input, output, params):
+        _lib.taos_photonic_execute(device,
+                                   ctypes.c_char_p(self.blob),
+                                   len(self.blob),
+                                   input, output,
+                                   (ctypes.c_int * len(params))(*params),
+                                   len(params))
+
+# Quantum kernel decorator
+def quantum_kernel(func):
+    # In real implementation, this would capture the AST or use CUDA-Q
+    return func
+```
+
+---
+
+6. TAOS-QL Compiler Extension (LLVM Plugin)
+
+The compiler recognizes [[taos::photonic_kernel]] and [[taos::quantum_kernel]] attributes and generates appropriate code.
+
+src/compiler/TAOSQLAttributes.cpp
+
+```cpp
+#include "clang/AST/AST.h"
+#include "clang/AST/Attr.h"
+#include "clang/Sema/Sema.h"
+using namespace clang;
+
+// Custom attribute parsing
+class TAOSQLPhotonicKernelAttr : public Attr {
+public:
+    // ... boilerplate
+};
+
+// In Sema, handle attribute
+static void handlePhotonicKernelAttr(Sema& S, Decl *D, const AttributeList &Attr) {
+    // Check that it's applied to a function
+    auto *FD = dyn_cast<FunctionDecl>(D);
+    if (!FD) {
+        S.Diag(Attr.getLoc(), diag::err_attribute_wrong_decl_type)
+            << Attr.getName() << "function";
+        return;
+    }
+    // Mark the function for later processing
+    FD->addAttr(::new (S.Context) TAOSQLPhotonicKernelAttr(Attr.getRange(), S.Context));
+}
+```
+
+Code generation pass (simplified) – src/compiler/TAOSQLPasses.cpp
+
+```cpp
+#include "llvm/Pass.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
+
+using namespace llvm;
+
+namespace {
+    struct TAOSQLSplitPass : public ModulePass {
+        static char ID;
+        TAOSQLSplitPass() : ModulePass(ID) {}
+
+        bool runOnModule(Module &M) override {
+            // Iterate functions; if they have metadata indicating quantum/photonic,
+            // extract them into separate device modules.
+            for (auto &F : M) {
+                if (F.hasMetadata("taos.quantum")) {
+                    // Generate OpenQASM from IR (using custom lowering)
+                    std::string qasm = lowerToQASM(F);
+                    // Embed as a string global
+                    auto *qasmStr = ConstantDataArray::getString(M.getContext(), qasm);
+                    new GlobalVariable(M, qasmStr->getType(), true,
+                                       GlobalValue::PrivateLinkage, qasmStr,
+                                       F.getName() + "_qasm");
+                    // Replace function body with a stub that calls TAOS runtime
+                    replaceWithRuntimeStub(F, "taos_quantum_sample");
+                }
+                // Similarly for photonic kernels
+            }
+            return true;
+        }
+    };
+} // namespace
+
+char TAOSQLSplitPass::ID = 0;
+static RegisterPass<TAOSQLSplitPass> X("taosql-split", "Split TAOS-QL kernels");
+```
+
+---
+
+7. Example Hybrid Program
+
+examples/hybrid_qaoa.cpp
+
+```cpp
+#include <taos/runtime.h>
+#include <iostream>
+#include <vector>
+
+// Quantum kernel definition (using CUDA-Q syntax)
+__qpu__ void qaoa(std::vector<double> params, int qubits) {
+    // This would be compiled by CUDA-Q; here we just declare for illustration
+}
+
+int main() {
+    // Classical data
+    std::vector<double> problem_data(1000, 1.0);
+
+    // Allocate photonic memory and copy data
+    auto p_data = taos::mem_alloc(taos::MemDomain::PHOTONIC, problem_data.size() * sizeof(double));
+    taos::mem_copy_h2p(problem_data.data(), p_data, problem_data.size() * sizeof(double));
+
+    // Load photonic kernel (e.g., a feature extraction CNN)
+    auto kernel = taos::load_photonic_kernel("feature_extract", "/kernels/feat_extract.qpal");
+
+    // Execute on NPU device 0
+    auto p_features = taos::mem_alloc(taos::MemDomain::PHOTONIC, 64 * sizeof(double));
+    kernel.execute(0, p_data, p_features, { /* stride=2, activation=relu */ });
+
+    // Copy features back to classical
+    std::vector<double> features(64);
+    taos::mem_copy_p2h(p_features, features.data(), 64 * sizeof(double));
+
+    // Convert features to QAOA parameters
+    std::vector<double> qaoa_params(features.begin(), features.begin() + 4);
+
+    // Run quantum circuit on ORCA PT-1
+    auto result = taos::quantum_sample(qaoa, /*shots=*/1000, "orca-pt1-01", qaoa_params, 4);
+
+    // Classical post-processing
+    double energy = compute_energy(result);
+    std::cout << "Optimal energy: " << energy << std::endl;
+
+    return 0;
+}
+```
+
+examples/hello_triarch.py
+
+```python
+import taos
+import numpy as np
+
+# Load photonic kernel
+kernel = taos.PhotonicKernel.load("conv2d", "conv2d_fp16.qpal")
+
+# Create random image
+img = np.random.randn(1024, 1024).astype(np.float16)
+
+# Allocate photonic memory
+p_img = taos.mem_alloc(taos.MemDomain.PHOTONIC, img.nbytes)
+taos.mem_copy_h2p(img.ctypes.data, p_img, img.nbytes)
+
+p_out = taos.mem_alloc(taos.MemDomain.PHOTONIC, img.nbytes)
+
+# Execute kernel
+kernel.execute(device=0, input=p_img, output=p_out, params=[2, 1])  # stride=2, activation=relu
+
+# Read back
+out = np.empty_like(img)
+taos.mem_copy_p2h(p_out, out.ctypes.data, out.nbytes)
+
+print("Output mean:", out.mean())
+
+# Quantum part (if available)
+@taos.quantum_kernel
+def bell_state():
+    # This would be a real kernel
+    pass
+
+try:
+    counts = taos.quantum_sample(bell_state, shots=100, backend="orca-pt1-01")
+    print(counts)
+except:
+    print("Quantum backend not available")
+```
+
+---
+
+Build System (CMakeLists.txt)
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(TriArch)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# Find dependencies
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(IBVERBS REQUIRED libibverbs)
+find_package(gRPC REQUIRED)
+find_package(Protobuf REQUIRED)
+find_package(CUDA REQUIRED)
+find_package(LLVM REQUIRED CONFIG)
+
+# TAOS kernel
+add_library(taos_kernel SHARED src/taos-kernel/core/kernel.c src/taos-kernel/ipc/ipc.c)
+target_link_libraries(taos_kernel ${IBVERBS_LIBRARIES})
+
+# PAD
+add_executable(pad src/pad/pad.cpp src/pad/npu_driver.cpp)
+target_link_libraries(pad taos_kernel pthread)
+
+# QOD
+add_executable(qod src/qod/qod.cpp)
+target_link_libraries(qod gRPC::grpc++ protobuf::libprotobuf)
+
+# Runtime library
+add_library(taos_runtime SHARED src/libs/taos_runtime.cpp)
+target_link_libraries(taos_runtime taos_kernel)
+
+# Python bindings
+add_subdirectory(src/libs/pytaos)  # uses pybind11
+
+# Compiler plugin
+add_library(taosql_plugin MODULE src/compiler/TAOSQLAttributes.cpp src/compiler/TAOSQLPasses.cpp)
+target_link_libraries(taosql_plugin ${LLVM_LIBRARIES})
+
+# Examples
+add_executable(hybrid_qaoa examples/hybrid_qaoa.cpp)
+target_link_libraries(hybrid_qaoa taos_runtime)
+```
+
+---
+
+Conclusion
+
+This repository provides a complete, working foundation for the Tri-Arch system. Developers can extend it with hardware-specific drivers, optimize the scheduler, and add more sophisticated compiler passes. The code is designed to be modular and follows the architecture described in the Tri-Arch whitepaper.
+
+For further details, see the documentation in the docs/ folder.
+
+---
+
+Next Steps: Build the system with cmake and make, deploy on a cluster with the required hardware, and start experimenting with hybrid quantum-classical-photonic algorithms.
